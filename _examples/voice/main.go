@@ -76,6 +76,26 @@ func play(client *bot.Client) {
 		conn.Close(closeCtx)
 	}()
 
+	// Handle voice connection errors
+	go func() {
+		for err := range conn.Errors() {
+			voiceErr := err.(voice.VoiceError)
+			slog.Error("voice connection error",
+				slog.Int("code", voiceErr.Code),
+				slog.String("description", voiceErr.Description),
+				slog.String("explanation", voiceErr.Explanation),
+				slog.Bool("resumeable", voiceErr.Resumeable),
+				slog.Any("guild_id", voiceErr.GuildID),
+			)
+
+			if !voiceErr.Resumeable {
+				slog.Error("non-resumeable error received, connection will be closed")
+				// In a real application, you might want to restart the connection here
+				return
+			}
+		}
+	}()
+
 	if err := conn.SetSpeaking(ctx, voice.SpeakingFlagMicrophone); err != nil {
 		panic("error setting speaking flag: " + err.Error())
 	}

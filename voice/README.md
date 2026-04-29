@@ -71,5 +71,38 @@ conn.UDP().Write(frame)
 conn.Close()
 ```
 
+## Error Handling
+
+Voice connections expose errors through a synchronous channel. This allows callers to handle non-resumeable errors by closing and restarting connections.
+
+```go
+conn := client.VoiceManager.CreateConn(guildID)
+
+// Subscribe to errors
+go func() {
+    for err := range conn.Errors() {
+        voiceErr := err.(voice.VoiceError)
+        
+        log.Printf("Voice error: code=%d, description=%s, resumeable=%v",
+            voiceErr.Code, voiceErr.Description, voiceErr.Resumeable)
+        
+        if !voiceErr.Resumeable {
+            // Non-resumeable error - close and restart
+            conn.Close(ctx)
+            conn = client.VoiceManager.CreateConn(guildID)
+            if err := conn.Open(ctx, channelID, false, false); err != nil {
+                log.Fatal(err)
+            }
+        }
+    }
+}()
+```
+
+**Important Notes:**
+- The error channel is unbuffered and synchronous
+- Only one subscriber should range over `Errors()`
+- The channel remains open during auto-reconnects; it is garbage collected when the Conn is garbage collected
+- All voice gateway close codes are exposed (both resumeable and non-resumeable)
+
 When using the voice package standalone you should create a voice manager. After this you can call `voice.Manager.CreateConn(guildID)`. After this you should send a `gateway.OpcodeVoiceStateUpdate` packet to the gateway.
 ```go

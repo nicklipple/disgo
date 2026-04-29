@@ -45,6 +45,11 @@ type (
 		// SetEventHandlerFunc lets listen for voice gateway events.
 		SetEventHandlerFunc(eventHandlerFunc EventHandlerFunc)
 
+		// Errors returns a receive-only channel for voice gateway errors.
+		// The channel is unbuffered and synchronous. Only one subscriber should range over this channel.
+		// The channel remains open during auto-reconnects; it is garbage collected when the Conn is garbage collected.
+		Errors() <-chan VoiceError
+
 		// Open opens the voice conn. It will connect to the voice gateway and start the Conn conn after it receives the Gateway events.
 		Open(ctx context.Context, channelID snowflake.ID, selfMute bool, selfDeaf bool) error
 
@@ -75,6 +80,7 @@ func NewConn(guildID snowflake.ID, userID snowflake.ID, voiceStateUpdateFunc Sta
 		openedChan: make(chan struct{}, 1),
 		closedChan: make(chan struct{}, 1),
 		ssrcs:      map[uint32]snowflake.ID{},
+		errChan:    make(chan VoiceError), // Unbuffered channel
 	}
 
 	daveSession := cfg.DaveSessionCreate(cfg.DaveSessionLogger, godave.UserID(userID.String()), conn)
@@ -103,6 +109,10 @@ type connImpl struct {
 
 	ssrcs   map[uint32]snowflake.ID
 	ssrcsMu sync.Mutex
+
+	// errChan is the channel for sending voice gateway errors to subscribers.
+	// It is unbuffered and closed when the connection closes.
+	errChan chan VoiceError
 }
 
 func (c *connImpl) SendMLSKeyPackage(mlsKeyPackage []byte) error {
@@ -168,6 +178,10 @@ func (c *connImpl) SetOpusFrameReceiver(handler OpusFrameReceiver) {
 
 func (c *connImpl) SetEventHandlerFunc(eventHandlerFunc EventHandlerFunc) {
 	c.config.EventHandlerFunc = eventHandlerFunc
+}
+
+func (c *connImpl) Errors() <-chan VoiceError {
+	return c.errChan
 }
 
 func (c *connImpl) HandleVoiceStateUpdate(update botgateway.EventVoiceStateUpdate) {
@@ -269,7 +283,15 @@ func (c *connImpl) handleMessage(gateway Gateway, op Opcode, sequenceNumber int,
 	}
 }
 
-func (c *connImpl) handleGatewayClose(_ Gateway, _ error, _ bool) {
+func (c *connImpl) handleGatewayClose(_ Gateway, voiceErr VoiceError) {
+	// Send error to subscribers before closing.
+	// Use select with default to avoid blocking if no subscriber is listening.
+	select {
+	case c.errChan <- voiceErr:
+	default:
+		// No subscriber or channel closed, continue with close
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	c.Close(ctx)

@@ -56,7 +56,8 @@ type (
 	GatewayCreateFunc func(daveManager godave.Session, eventHandlerFunc EventHandlerFunc, closeHandlerFunc CloseHandlerFunc, opts ...GatewayConfigOpt) Gateway
 
 	// CloseHandlerFunc is a function that handles a voice gateway close.
-	CloseHandlerFunc func(gateway Gateway, err error, reconnect bool)
+	// The voiceError contains rich information about the close event.
+	CloseHandlerFunc func(gateway Gateway, voiceError VoiceError)
 
 	// StateProviderFunc is a function that provides the current conn state of the voice gateway.
 	StateProviderFunc func() State
@@ -337,7 +338,19 @@ func (g *gatewayImpl) doReconnect(ctx context.Context, state State) error {
 		var closeError *websocket.CloseError
 		if errors.As(err, &closeError) {
 			closeCode := GatewayCloseEventCodeByCode(closeError.Code)
+			voiceErr := VoiceError{
+				GuildID:     g.state.GuildID,
+				Code:        closeCode.Code,
+				Description: closeCode.Description,
+				Explanation: closeCode.Explanation,
+				Resumeable:  closeCode.Reconnect,
+				Err:         err,
+			}
 			if !closeCode.Reconnect {
+				// Notify handler of non-resumeable error before returning
+				if g.closeHandlerFunc != nil {
+					g.closeHandlerFunc(g, voiceErr)
+				}
 				return err
 			}
 		}
@@ -355,8 +368,29 @@ func (g *gatewayImpl) reconnect() {
 	if err := g.doReconnect(context.Background(), g.state); err != nil {
 		g.config.Logger.Error("failed to reopen voice gateway", slog.Any("err", err))
 
-		if g.closeHandlerFunc != nil {
-			g.closeHandlerFunc(g, err, false)
+		var closeError *websocket.CloseError
+		if errors.As(err, &closeError) {
+			closeCode := GatewayCloseEventCodeByCode(closeError.Code)
+			if g.closeHandlerFunc != nil {
+				g.closeHandlerFunc(g, VoiceError{
+					GuildID:     g.state.GuildID,
+					Code:        closeCode.Code,
+					Description: closeCode.Description,
+					Explanation: closeCode.Explanation,
+					Resumeable:  closeCode.Reconnect,
+					Err:         err,
+				})
+			}
+		} else if g.closeHandlerFunc != nil {
+			// Generic error
+			g.closeHandlerFunc(g, VoiceError{
+				GuildID:     g.state.GuildID,
+				Code:        0,
+				Description: "Reconnect failed",
+				Explanation: "Failed to reconnect to voice gateway",
+				Resumeable:  true,
+				Err:         err,
+			})
 		}
 	}
 }
@@ -490,6 +524,15 @@ func (g *gatewayImpl) listen(conn *websocket.Conn, ready func(error)) {
 				closeCode := GatewayCloseEventCodeByCode(closeError.Code)
 				reconnect = closeCode.Reconnect
 
+				voiceErr := VoiceError{
+					GuildID:     g.state.GuildID,
+					Code:        closeCode.Code,
+					Description: closeCode.Description,
+					Explanation: closeCode.Explanation,
+					Resumeable:  closeCode.Reconnect,
+					Err:         err,
+				}
+
 				msg := "voice gateway close received"
 				args := []any{
 					slog.Bool("reconnect", reconnect),
@@ -501,19 +544,46 @@ func (g *gatewayImpl) listen(conn *websocket.Conn, ready func(error)) {
 				} else {
 					g.config.Logger.Error(msg, args...)
 				}
+
+				// Always send error to handler, letting caller decide what to do
+				if g.closeHandlerFunc != nil {
+					g.closeHandlerFunc(g, voiceErr)
+				}
 			} else if errors.Is(err, net.ErrClosed) {
 				// we closed the connection ourselves. Don't try to reconnect here
 				reconnect = false
+
+				// Send error for self-closed connection
+				if g.closeHandlerFunc != nil {
+					g.closeHandlerFunc(g, VoiceError{
+						GuildID:     g.state.GuildID,
+						Code:        0,
+						Description: "Connection closed",
+						Explanation: "The connection was closed locally",
+						Resumeable:  false,
+						Err:         err,
+					})
+				}
 			} else {
 				g.config.Logger.Warn("failed to read next message from voice gateway", slog.Any("err", err))
+
+				// Send generic error
+				if g.closeHandlerFunc != nil {
+					g.closeHandlerFunc(g, VoiceError{
+						GuildID:     g.state.GuildID,
+						Code:        0,
+						Description: "Read error",
+						Explanation: "Failed to read from voice gateway",
+						Resumeable:  true,
+						Err:         err,
+					})
+				}
 			}
 
 			// make sure the connection is properly closed
 			g.CloseWithCode(websocket.CloseServiceRestart, "reconnecting")
 			if g.config.AutoReconnect && reconnect {
 				go g.reconnect()
-			} else if g.closeHandlerFunc != nil {
-				go g.closeHandlerFunc(g, err, reconnect)
 			}
 
 			return
